@@ -73,6 +73,8 @@ export interface Snapshot {
   label: string;
   createdAt: number;
   note?: string;
+  /** true 表示「恢复前自动备份」，恢复时同内容的自动备份会被复用，避免重复堆积 */
+  auto?: boolean;
   data: Archive;
 }
 
@@ -479,14 +481,54 @@ export function cloneArchive(archive: Archive): Archive {
   return structuredCloneShim(archive);
 }
 
-export function snapshotArchive(archive: Archive, label: string, note?: string): Snapshot {
+/**
+ * 关键不变量：快照数据必须「拍平」——data 内的 snapshots 永远为空数组。
+ * 否则快照会内嵌此前的整棵快照树，每次恢复都会让数据量指数膨胀，
+ * 配合纹样图 dataURL 几次恢复即可把 structuredClone/JSON 序列化拖到卡死。
+ */
+function flatContent(archive: Archive): Archive {
+  return { ...cloneArchive(archive), snapshots: [] };
+}
+
+export function snapshotArchive(archive: Archive, label: string, note?: string, auto = false): Snapshot {
   return {
     id: uid("snap"),
     label,
     note,
+    auto,
     createdAt: nowTs(),
-    data: cloneArchive(archive),
+    data: flatContent(archive),
   };
+}
+
+/** 两份档案的「业务内容」是否相同（忽略 id/快照列表/时间戳/归档态） */
+export function sameArchiveContent(a: Archive, b: Archive): boolean {
+  const strip = (x: Archive) => ({
+    code: x.code,
+    name: x.name,
+    origin: x.origin,
+    era: x.era,
+    knotDensity: x.knotDensity,
+    fiber: x.fiber,
+    dye: x.dye,
+    patternImage: x.patternImage,
+    regions: x.regions,
+    materials: x.materials,
+    steps: x.steps,
+  });
+  return JSON.stringify(strip(a)) === JSON.stringify(strip(b));
+}
+
+/**
+ * 迁移/净化历史数据：把旧版本可能嵌套的快照树拍平。
+ * 顶层快照列表保留，每个快照内部的 snapshots 清空（被嵌套的快照都已在顶层存在）。
+ */
+export function flattenNestedSnapshots(snapshots: Snapshot[]): Snapshot[] {
+  return snapshots.map((s) =>
+    s.data && Array.isArray(s.data.snapshots) && s.data.snapshots.length > 0
+      ? { ...s, data: { ...s.data, snapshots: [] } }
+      : s,
+  );
 }
 
 // ---------------------------------------------------------------------------

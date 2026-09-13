@@ -14,6 +14,7 @@ import {
   colorDelta,
   duplicateArchive,
   emptySteps,
+  flattenNestedSnapshots,
   makeArchive,
   nextCode,
   nowTs,
@@ -21,6 +22,7 @@ import {
   repairMaterialReady,
   reservedByMaterial,
   requirementStatus,
+  sameArchiveContent,
   seedMaterials,
   seedState,
   snapshotArchive,
@@ -209,13 +211,21 @@ function coreReducer(state: AppState, action: Action): AppState {
       return mapArchive(state, action.id, (a) => {
         const snap = a.snapshots.find((s) => s.id === action.snapshotId);
         if (!snap) return a;
-        // 恢复前自动留存当前状态，历史记录不丢
-        const safety = snapshotArchive(a, `恢复前自动备份 · ${a.code}`);
+        // 恢复前自动留存当前状态：若列表中已存在内容相同的快照（手动或自动，
+        // 典型情况是当前状态本就由某个快照恢复而来），直接复用它作为备份，
+        // 不重复创建；否则新建一条「恢复前自动备份」。所有快照数据均拍平，绝不嵌套。
+        const alreadyBackedUp = a.snapshots.some((s) => sameArchiveContent(s.data, a));
+        const safetyList = alreadyBackedUp
+          ? a.snapshots
+          : [snapshotArchive(a, `恢复前自动备份 · ${a.code}`, undefined, true), ...a.snapshots];
         const restored: Archive = {
           ...clone(snap.data),
           id: a.id,
           code: a.code,
-          snapshots: [safety, ...a.snapshots],
+          // 恢复的是拍平内容（snapshots 为空），把现有快照列表原样接回，不复制嵌套树
+          snapshots: safetyList.map((s) =>
+            s.data.snapshots.length > 0 ? { ...s, data: { ...s.data, snapshots: [] } } : s,
+          ),
           archived: false,
           updatedAt: nowTs(),
         };
@@ -313,15 +323,15 @@ function loadInitial(): HistoryState {
   return { past: [], present: base, future: [], lastSaved: 0 };
 }
 
-/** 旧数据/导入数据补齐字段，避免运行期 undefined */
-function sanitize(state: AppState): AppState {
+/** 旧数据/导入数据补齐字段，避免运行期 undefined；同时拍平旧版嵌套快照防止卡死 */
+export function sanitize(state: AppState): AppState {
   const archives = state.archives.map((a) =>
     makeArchive({
       ...a,
       steps: { ...emptySteps(), ...(a.steps ?? {}) },
       regions: (a.regions ?? []).map((r) => ({ ...r, areaPct: r.areaPct ?? rectAreaPct(r) })),
       materials: a.materials ?? [],
-      snapshots: a.snapshots ?? [],
+      snapshots: flattenNestedSnapshots(a.snapshots ?? []),
     }),
   );
   const activeId = archives.some((a) => a.id === state.activeId) ? state.activeId : archives[0]?.id ?? null;

@@ -10,17 +10,20 @@ import {
   archiveBlockers,
   colorDelta,
   findOverlaps,
+  flattenNestedSnapshots,
   makeArchive,
   nextCode,
   rectAreaPct,
   reservedByMaterial,
   requirementStatus,
+  sameArchiveContent,
   seedMaterials,
   seedState,
   emptySteps,
+  snapshotArchive,
   uid,
 } from "../src/model.ts";
-import { coreReducer, historyReducer, undoHistory, redoHistory, stepAdvanceBlocked, type Action } from "../src/store.ts";
+import { coreReducer, historyReducer, undoHistory, redoHistory, sanitize, stepAdvanceBlocked, type Action } from "../src/store.ts";
 
 let passed = 0;
 function check(name: string, fn: () => void) {
@@ -189,25 +192,180 @@ check("全部满足时可归档，归档动作置位", () => {
   assert.equal(s.archives[0].archived, true);
 });
 
-console.log("\n[7] 版本快照：创建 / 恢复保留历史");
-check("恢复旧版本：内容回滚、id 与编号不变、自动备份入快照列表、取消归档", () => {
+console.log("\n[7] 版本快照：创建 / 恢复保留历史 / 不嵌套膨胀（卡死回归）");
+
+/** 统计快照树中所有节点（含嵌套）的数量；修复后除顶层外不应有任何嵌套节点 */
+function countNestedSnapshotNodes(archive: Archive): number {
+  let n = 0;
+  for (const s of archive.snapshots) {
+    n += s.data.snapshots.length;
+    // 再深一层也必须为 0（旧 bug 会在深处堆积整棵树）
+    for (const inner of s.data.snapshots) n += inner.data.snapshots.length;
+  }
+  return n;
+}
+
+/** 估算状态 JSON 体积，用来观察是否指数膨胀 */
+function sizeOf(s: unknown): number {
+  return JSON.stringify(s).length;
+}
+
+check("不变量：创建的快照 data.snapshots 恒为空，绝不内嵌快照树", () => {
+  let s = state;
+  s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "v1" });
+  s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "v2" });
+  s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "v3" });
+  const arc = s.archives.find((a) => a.id === a2.id)!;
+  assert.equal(arc.snapshots.length, 3);
+  assert.equal(countNestedSnapshotNodes(arc), 0);
+  for (const snap of arc.snapshots) assert.deepEqual(snap.data.snapshots, []);
+});
+
+check("恢复旧版本：内容回滚、id 与编号不变、自动备份入列表、取消归档", () => {
   let s = state;
   s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "v1 初版" });
   let arc = s.archives.find((a) => a.id === a2.id)!;
   const snapId = arc.snapshots[0].id;
-  // 修改档案
   s = coreReducer(s, { type: "updateMeta", id: a2.id, patch: { name: "改名后的毯子" } });
   s = coreReducer(s, { type: "archive", id: a2.id, materials: mats });
   assert.equal(s.archives.find((a) => a.id === a2.id)!.name, "改名后的毯子");
-  // 恢复
   s = coreReducer(s, { type: "restoreSnapshot", id: a2.id, snapshotId: snapId });
   arc = s.archives.find((a) => a.id === a2.id)!;
   assert.equal(arc.name, a2.name, "名称回到快照时状态");
   assert.equal(arc.archived, false, "恢复后为未归档");
   assert.equal(arc.id, a2.id);
   assert.equal(arc.code, a2.code);
-  assert.ok(arc.snapshots.some((x) => x.label.includes("恢复前自动备份")), "恢复前自动备份存在");
+  assert.ok(arc.snapshots.some((x) => x.auto && x.label.includes("恢复前自动备份")), "恢复前自动备份存在");
   assert.ok(arc.snapshots.some((x) => x.id === snapId), "旧快照仍保留");
+  assert.equal(countNestedSnapshotNodes(arc), 0, "恢复后仍无嵌套快照");
+});
+
+check("连续恢复 5 次：快照数恒定、体积不指数膨胀、每次 <100ms 返回（卡死回归）", () => {
+  let s = state;
+  // v1 初版快照
+  s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "v1 初版" });
+  const v1 = s.archives.find((a) => a.id === a2.id)!.snapshots[0].id;
+  // 改名后再拍一张 v2
+  s = coreReducer(s, { type: "updateMeta", id: a2.id, patch: { name: "恢复前名字" } });
+  s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "v2 改名" });
+  const arc0 = s.archives.find((a) => a.id === a2.id)!;
+  const v2 = arc0.snapshots[0].id;
+  const baselineSize = sizeOf(arc0);
+  const baselineCount = arc0.snapshots.length;
+
+  // 在两个版本间交替恢复 5 次，每次都必须很快返回（奇数次最终落在 v1）
+  let latest = s;
+  for (let i = 0; i < 5; i += 1) {
+    const target = i % 2 === 0 ? v1 : v2;
+    const t0 = process.hrtime.bigint();
+    latest = coreReducer(latest, { type: "restoreSnapshot", id: a2.id, snapshotId: target });
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.ok(ms < 100, `第 ${i + 1} 次恢复耗时 ${ms.toFixed(1)}ms 应 < 100ms`);
+  }
+  const arc = latest.archives.find((a) => a.id === a2.id)!;
+
+  // 两个恢复目标都已存在于快照列表中：任何一次恢复都不需要新增备份，数量恒定
+  assert.equal(arc.snapshots.length, baselineCount, `快照数应恒为 ${baselineCount}，实际 ${arc.snapshots.length}`);
+  // 体积也应基本不变（只允许因线性新增出现常数倍，这里为 1 倍）
+  const finalSize = sizeOf(arc);
+  assert.ok(
+    finalSize < baselineSize * 1.5,
+    `体积疑似膨胀：${finalSize} vs baseline ${baselineSize}`,
+  );
+  assert.equal(countNestedSnapshotNodes(arc), 0, "连续恢复后深层嵌套仍为 0");
+
+  // 交替恢复 6 次（偶数次），当前内容应等于 v1（原始 a2 内容）
+  assert.equal(arc.name, a2.name);
+});
+
+check("同一内容连续点恢复：自动备份去重复用，不产生重复 safety", () => {
+  let s = state;
+  s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "v1" });
+  const v1 = s.archives.find((a) => a.id === a2.id)!.snapshots[0].id;
+  // 当前内容 == v1（快照刚由当前状态生成），v1 本身即备份，恢复时复用、不新增
+  s = coreReducer(s, { type: "restoreSnapshot", id: a2.id, snapshotId: v1 });
+  const n1 = s.archives.find((a) => a.id === a2.id)!.snapshots.length;
+  assert.equal(n1, 1, "当前内容已有同名快照时不重复建备份");
+  // 不做任何编辑，立即再次恢复同一版本：列表中已有相同内容快照，不新增
+  s = coreReducer(s, { type: "restoreSnapshot", id: a2.id, snapshotId: v1 });
+  const n2 = s.archives.find((a) => a.id === a2.id)!.snapshots.length;
+  assert.equal(n2, n1, "相同内容重复恢复不增加快照");
+
+  // 场景二：当前内容是编辑后的新状态（列表无相同快照）→ 新增 1 条 safety；
+  // 再切到别的版本、再切回来时，已保存的 safety 被复用，不会重复建。
+  let s2 = state;
+  s2 = coreReducer(s2, { type: "createSnapshot", id: a2.id, label: "base" });
+  const base = s2.archives.find((a) => a.id === a2.id)!.snapshots[0].id;
+  s2 = coreReducer(s2, { type: "updateMeta", id: a2.id, patch: { name: "新状态A" } });
+  s2 = coreReducer(s2, { type: "createSnapshot", id: a2.id, label: "verA" });
+  const verA = s2.archives.find((a) => a.id === a2.id)!.snapshots[0].id;
+  const countBefore = s2.archives.find((a) => a.id === a2.id)!.snapshots.length;
+  // 当前 == verA，恢复到 base：无需 safety（verA 已是当前的备份）
+  s2 = coreReducer(s2, { type: "restoreSnapshot", id: a2.id, snapshotId: base });
+  const countAfterFirst = s2.archives.find((a) => a.id === a2.id)!.snapshots.length;
+  assert.equal(countAfterFirst, countBefore, "当前状态已被某快照覆盖时不新增备份");
+  // 再恢复回 verA：同样不需要
+  s2 = coreReducer(s2, { type: "restoreSnapshot", id: a2.id, snapshotId: verA });
+  const countAfterSecond = s2.archives.find((a) => a.id === a2.id)!.snapshots.length;
+  assert.equal(countAfterSecond, countBefore, "来回切换不膨胀");
+  assert.equal(s2.archives.find((a) => a.id === a2.id)!.name, "新状态A");
+});
+
+check("恢复后可继续编辑 / 撤销 / 重做 / 再次创建快照", () => {
+  let s = state;
+  s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "v1" });
+  const v1 = s.archives.find((a) => a.id === a2.id)!.snapshots[0].id;
+  s = coreReducer(s, { type: "updateMeta", id: a2.id, patch: { name: "临时改动" } });
+  s = coreReducer(s, { type: "restoreSnapshot", id: a2.id, snapshotId: v1 });
+
+  // 继续编辑
+  s = coreReducer(s, { type: "updateMeta", id: a2.id, patch: { name: "恢复后新编辑" } });
+  assert.equal(s.archives.find((a) => a.id === a2.id)!.name, "恢复后新编辑");
+
+  // 再创建快照：新快照拍平，且恢复前自动备份仍在
+  s = coreReducer(s, { type: "createSnapshot", id: a2.id, label: "恢复后 v2" });
+  const arc = s.archives.find((a) => a.id === a2.id)!;
+  assert.ok(arc.snapshots.some((x) => x.label === "恢复后 v2"));
+  assert.ok(arc.snapshots.some((x) => x.auto));
+  assert.equal(countNestedSnapshotNodes(arc), 0);
+
+  // 在含「恢复」操作的历史栈上验证撤销/重做：
+  let h: ReturnType<typeof historyReducer> = { past: [], present: state, future: [], lastSaved: 0 };
+  h = historyReducer(h, { type: "createSnapshot", id: a2.id, label: "v1-h" } as Action);
+  h = historyReducer(h, { type: "updateMeta", id: a2.id, patch: { name: "临时" } } as Action);
+  const snapIdH = h.present.archives.find((a) => a.id === a2.id)!.snapshots.find((x) => x.label === "v1-h")!.id;
+  h = historyReducer(h, { type: "restoreSnapshot", id: a2.id, snapshotId: snapIdH } as Action);
+  h = historyReducer(h, { type: "updateMeta", id: a2.id, patch: { name: "再编辑" } } as Action);
+  h = undoHistory(h); // 撤销「再编辑」
+  assert.equal(h.present.archives.find((a) => a.id === a2.id)!.name, a2.name, "撤销跨过恢复操作后内容正确");
+  h = redoHistory(h);
+  assert.equal(h.present.archives.find((a) => a.id === a2.id)!.name, "再编辑", "重做可用");
+});
+
+check("旧版嵌套快照数据经 sanitize（刷新/导入）后被拍平，且快照不丢失", () => {
+  // 手工构造旧 bug 时代的嵌套结构
+  const arc = makeArchive({ code: "CAR-OLD", patternImage: "data:image/svg+xml,x" });
+  const inner = snapshotArchive(makeArchive({ code: "CAR-OLD", name: "更早版本" }), "内层快照");
+  const oldSnap = snapshotArchive(arc, "外层快照");
+  (oldSnap.data as Archive).snapshots = [inner]; // 模拟旧数据的嵌套
+  arc.snapshots = [oldSnap];
+  const migrated = sanitize({ archives: [arc], activeId: arc.id });
+  const m = migrated.archives[0];
+  assert.equal(m.snapshots.length, 1, "顶层快照保留");
+  assert.equal(m.snapshots[0].label, "外层快照");
+  assert.deepEqual(m.snapshots[0].data.snapshots, [], "嵌套被清空");
+  assert.equal(countNestedSnapshotNodes(m), 0);
+  // flattenNestedSnapshots 直接调用也应幂等
+  const twice = flattenNestedSnapshots(flattenNestedSnapshots(m.snapshots));
+  assert.deepEqual(twice, m.snapshots);
+});
+
+check("sameArchiveContent 只比较业务内容（时间戳/快照/归档态不影响）", () => {
+  const a = makeArchive({ code: "X", name: "同内容" });
+  const b = { ...a, updatedAt: a.updatedAt + 9999, archived: true, snapshots: [snapshotArchive(a, "s")] };
+  assert.ok(sameArchiveContent(a, b));
+  const c = { ...a, name: "不同" };
+  assert.ok(!sameArchiveContent(a, c));
 });
 
 console.log("\n[8] 撤销 / 重做：历史栈行为");
